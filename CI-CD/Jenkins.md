@@ -239,3 +239,131 @@
    - Docker
    - Kubernetes
    - AWS
+
+## **Useful Plugins**
+#### Production level jenkins file
+```groovy
+@Library('my-shared-library') _
+
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV', 
+            choices: ['staging', 'production'], 
+            description: 'Target environment for GitOps update'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS', 
+            defaultValue: false, 
+            description: 'Skip unit testing and security scans if urgent'
+        )
+    }
+
+    environment {
+        APP_NAME         = 'ecom-frontend'
+        IMAGE_NAME       = "my-docker-registry/${env.APP_NAME}"
+        IMAGE_TAG        = "${env.BUILD_NUMBER}"
+        
+        // NEW GITOPS VARIABLES: Reference your infrastructure config repository
+        GITOPS_REPO_URL  = 'https://github.com'
+        GITOPS_CREDS_ID  = 'github-gitops-ssh-key' // Jenkins Credential ID for Git push
+    }
+
+    options {
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+        disableConcurrentBuilds()
+        keepJenkinsSystemLog()
+    }
+
+    stages {
+        stage('Initialize & Clean') {
+            steps {
+                echo "Starting GitOps Build #${env.BUILD_NUMBER}"
+                cleanWs()
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                nodejs('NodeJS-20') { sh 'npm ci' }
+            }
+        }
+
+        stage('Unit Tests') {
+            when { expression { !params.SKIP_TESTS } }
+            steps {
+                nodejs('NodeJS-20') { sh 'npm test -- --coverage --watchAll=false' }
+            }
+        }
+
+        stage('Security & Code Scan') {
+            when { expression { !params.SKIP_TESTS } }
+            steps {
+                withSonarQubeEnv('SonarQube-Server') { sh 'npm run sonar-scanner' }
+                timeout(time: 10, unit: 'MINUTES') { waitForQualityGate abortPipeline: true }
+            }
+        }
+
+        stage('Build Artifact & Container') {
+            steps {
+                script {
+                    nodejs('NodeJS-20') { sh 'npm run build' }
+                    sh "docker build -t ${env.IMAGE_NAME}:${env.IMAGE_TAG} ."
+                }
+            }
+        }
+
+        stage('Publish Registry') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
+                    sh "docker push ${env.IMAGE_NAME}:${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        // NEW GITOPS STAGE: Replaces the 'Deploy Application' step completely
+        stage('Update GitOps Repository') {
+            steps {
+                // 1. Clean the directory to create a fresh workspace for cloning the infra repo
+                dir('gitops-workspace') {
+                    // 2. Checkout your infrastructure repository using dedicated write credentials
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],
+                        userRemoteConfigs: [[url: env.GITOPS_REPO_URL, credentialsId: env.GITOPS_CREDS_ID]]
+                    ])
+
+                    script {
+                        // 3. Update the specific image tag inside your infrastructure manifest file
+                        // This example assumes a plain YAML structure under environments/env_name/
+                        def manifestPath = "environments/${params.DEPLOY_ENV}/deployment.yaml"
+                        
+                        sh """
+                            sed -i 's|image: ${env.IMAGE_NAME}:.*|image: ${env.IMAGE_NAME}:${env.IMAGE_TAG}|g' ${manifestPath}
+                        """
+
+                        // 4. Commit and push changes back to Git so Argo CD can see them
+                        sh """
+                            git config user.name "Jenkins CI"
+                            git config user.email "jenkins-ci@yourcompany.com"
+                            git add ${manifestPath}
+                            git commit -m "chore(gitops): update ${env.APP_NAME} image to tag ${env.IMAGE_TAG} in ${params.DEPLOY_ENV} [skip ci]"
+                            git push origin main
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success { notifySlack('#ops-alerts') }
+        failure { notifySlack('#ops-alerts') }
+    }
+}
+
+```
