@@ -590,3 +590,132 @@ services:
 - [Docker Hub](https://hub.docker.com/)
 - [Docker GitHub Repository](https://github.com/docker/docker-ce)
 - [Docker Forums](https://forums.docker.com/)
+
+### Production Dockerfiles for Nodejs Backend Microservice
+
+```dockerfile
+
+FROM node:24-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+FROM node:24-alpine
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN addgroup -S nodejs && \
+    adduser -S appuser -G nodejs
+USER appuser
+EXPOSE 3000
+HEALTHCHECK --internal=30s --timeout=3s \
+  CMD node -e "fetch('http://localhost:3000/health').then(()=>process.exit(0)).catch(()=>process.exit(1))"
+CMD ["node", "server.js"]
+```
+#### Typescript
+
+```dockerfile
+FROM node:24-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+
+FROM node:24-alpine
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+RUN addgroup -S nodejs && \
+    adduser -S appuser -G nodejs
+USER appuser
+EXPOSE 3000
+CMD ["node","dist/main.js"]
+```
+#### React (Vite)
+```dockerfile
+FROM node:24-alpine AS builder
+WORKDIR /app
+COPY package*.json .
+RUN npm ci --omit=dev
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx","-g", "daemon off;"]
+```
+### Production Dockerfile for Next.js
+```dockerfile
+FROM node:24-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:24-slim
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/package*.json ./
+
+RUN npm ci --omit=dev
+EXPOSE 3000
+CMD ["npm","start"]
+
+```
+### Folder Structure
+```plaintext
+project/
+
+│
+├── backend/
+│      ├── Dockerfile
+│      ├── .dockerignore
+│      └── ...
+│
+├── frontend/
+│      ├── Dockerfile
+│      ├── .dockerignore
+│      └── ...
+│
+├── docker-compose.yml
+│
+└── .env
+```
+### DockerCompose file
+```YAML
+version: "3.0"
+
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "80:80"
+  backend:
+    build: ./backend
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+  postgres:
+    image: postgres:17-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
+```
